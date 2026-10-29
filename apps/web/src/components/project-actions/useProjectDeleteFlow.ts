@@ -40,8 +40,12 @@ export function useProjectDeleteFlow(input: {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const accountGeneration = currentWorkspaceAccountGeneration();
   const { history, status } = useProjectShareHistoryState(target && workspaceContext ? target.id : undefined, workspaceContext, 'delete-confirmation');
-  const shareReadStatus = target && !workspaceContext ? 'error' : status;
-  const activeShareCount = history ? history.publications.filter(publication => publication.status === 'active').length : null;
+  // In self-hosted mode there is no workspace context, so share-state is
+  // unavailable (WORKSPACE_CONTEXT_REQUIRED). Treat that as "no active
+  // shares" so deletion is not blocked by a share-read that can never
+  // succeed outside a collab workspace.
+  const shareReadStatus = target && !workspaceContext ? 'ready' : status;
+  const activeShareCount = target && !workspaceContext ? 0 : (history ? history.publications.filter(publication => publication.status === 'active').length : null);
 
   const request = useCallback((project: Project) => {
     setFailed(false);
