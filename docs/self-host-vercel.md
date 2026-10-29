@@ -95,12 +95,7 @@ frontend gate — but the correct fix (`if (!context) return 0;`) touches
 upstream-shared share-flow logic and is left for a deliberate upstream PR
 rather than a local patch.
 
-## Known gap: the frontend and the daemon are on two origins
-
-**This deployment is not the topology upstream documents, and the split
-breaks the browser's credential handshake.** Everything below describes the
-current fork-local arrangement; upstream's documented arrangement is
-described at the end of this section.
+## Topology: one origin, as upstream documents it
 
 Upstream ships the web UI and the API from **one** origin. The published
 container serves both: `deploy/docker-compose.yml` sets `OD_PORT=7456` and
@@ -114,67 +109,90 @@ The browser prompts once, caches those credentials for the origin, and every
 later same-origin `/api` call carries the header. The whole design depends
 on the document and the API sharing an origin.
 
-This fork splits them:
+This deployment now does the same, in two hops:
 
 ```
-browser ─▶ blueishdragonz-opendesign.vercel.app   (Vercel static export, NO auth)
-             │  document  → 200, no WWW-Authenticate   ← the handshake never starts
-             └─ /api, /artifacts, /frames ─▶ funnel ─▶ nginx auth_basic ─▶ daemon
+browser ─▶ blueishdragonz-opendesign.vercel.app        (Vercel, pure reverse proxy)
+             │  every path ─▶ funnel :8443 ─▶ nginx :8009 ─▶ daemon :7456
+             │                  (auth_basic "OpenDesign" on ALL paths)
+             └─ one origin, one 401 challenge, browser caches the credentials
 ```
 
-The document is served by Vercel with no authentication, so the browser
-never receives a 401 challenge for the origin and never caches credentials.
-Every `/api`, `/artifacts` and `/frames` request therefore arrives at nginx
-without an `Authorization` header and is answered `401`. The app renders its
-onboarding/sign-in screen instead of the project list, and files cannot be
-opened.
+- **Vercel** is a pure proxy: `vercel.json` has a single `routes` entry
+  (`/(.*)` → the funnel on `:8443`) and builds nothing. It must be `routes`,
+  not `rewrites` — with `rewrites` Vercel serves its own filesystem first,
+  so `/` returns `404` before the rewrite is ever considered.
+- **nginx** has a dedicated server block on `:8009`
+  (`/etc/nginx/conf.d/opendesign-proxy.conf`) that proxies every path to the
+  daemon with `auth_basic "OpenDesign"`. It is a separate block because
+  nginx's `location /` on `:8080` belongs to **n8n** (the editor), and
+  sharing that server block would put the document and the API on two
+  origins again — the exact failure this topology avoids.
+- **The daemon** serves the SPA shell, the assets and the API, and its own
+  SPA fallback handles deep links (`/projects/<id>`, `/settings`,
+  `/oc/<slug>`) and trailing slashes with no extra rewrite.
 
-This is **not** a daemon or proxy fault. With credentials supplied, the whole
-API surface answers `200` through the same Vercel URL
-(`/api/version`, `/api/projects`, `/api/app-config`, `/api/agents`,
-`/api/plugins`, `/api/skills`, `/api/design-systems`), and Vercel does
-forward the `Authorization` header upstream. Only the handshake is missing.
+n8n keeps the funnel on `:443` → nginx `:8080` → n8n on `127.0.0.1:5678`.
+The two services share the VM, the nginx instance and the tailnet node
+without sharing a port, a path or a credential realm.
 
-Two further consequences of the split:
+### Why the daemon image is built from this fork
 
-- nginx's `location /` on the funnel proxies to **n8n** (`127.0.0.1:5678`),
-  not to the daemon. OpenDesign's own UI is not reachable through the funnel
-  at all — only the API paths are. The documented single-origin model would
-  put it at the funnel root.
-- Upstream's `vercel.json` has **no** rewrites. The catch-all SPA rewrite
-  and the three funnel rewrites in this fork are local additions. Upstream's
-  supported way to run a separate frontend against a remote daemon is the
-  **web sidecar** (`apps/web/sidecar/server.ts`, `OD_WEB_OUTPUT_MODE=server`),
-  a Node server that serves the SPA and proxies `/api`, `/artifacts` and
-  `/frames` to the daemon — it forwards the browser's `Authorization` header
-  unchanged and does not inject credentials of its own. A raw static export
-  on Vercel has no equivalent.
+Under this topology the browser receives the UI **built into the daemon
+image**, so the `useProjectDeleteFlow.ts` fix is only live if the image is
+built from this fork. The image on hermes-oci is
+`open-design:fork-chromium-2026-10-29`: `deploy/Dockerfile` built from
+`BlueishDragonz/open-design`, with the host's Chromium and CLI-tooling
+layers applied on top (`/home/opc/open-design-build/Dockerfile.local`, whose
+`FROM` line points at the fork build instead of
+`ghcr.io/nexu-io/od:latest`).
 
-### Closing the gap
+To rebuild after an upstream merge:
 
-Make the document and the API share an origin again, so the browser gets one
-401 challenge and caches the credentials:
+```bash
+ssh hermes-oci
+cd /home/opc/src && curl -fsSL -o od.tar.gz \
+  https://codeload.github.com/BlueishDragonz/open-design/tar.gz/refs/heads/main
+tar xzf od.tar.gz && mv open-design-main open-design && rm od.tar.gz
+cd open-design && docker build -f deploy/Dockerfile -t open-design:fork-2026-10-29 .
+cd /home/opc/open-design-build
+sed 's|^FROM ghcr.io/nexu-io/od:latest$|FROM open-design:fork-2026-10-29|' \
+  Dockerfile.local > Dockerfile.fork
+docker build -f Dockerfile.fork -t open-design:fork-chromium-2026-10-29 .
+cd /home/opc/open-design && docker compose up -d --force-recreate --no-deps open-design
+```
 
-1. Point the Vercel deployment at the daemon for **all** paths (document,
-   `/_next/...`, `/api`, `/artifacts`, `/frames`) instead of serving a static
-   export — a `/:path*` rewrite to the funnel, no `destination:
-   /index.html`.
-2. Give nginx an OpenDesign server block that proxies those paths to
-   `127.0.0.1:7456` with `auth_basic "OpenDesign"`, including the document.
-   n8n currently owns `location /` on that server (it is paused, so it can
-   move to a path prefix or to port 8443).
-3. Keep `OD_DISABLE_API_AUTH=1` and `OD_API_TOKEN` as they are. That pair is
-   upstream's documented "trusted reverse proxy" mode
-   (`deploy/README.md`): the proxy authenticates every request, so the
-   daemon does not enforce bearer tokens itself.
-4. `OD_ALLOWED_ORIGINS` already lists both the Vercel origin and the funnel
-   origin, which is what `isLocalSameOrigin` needs behind a proxy.
+There is **no git on hermes-oci** — fetch the source as a codeload tarball,
+as above.
 
-Note the trade-off: under this topology the browser receives the UI **built
-into the daemon image**, not the patched `apps/web` build. To keep this
-fork's `useProjectDeleteFlow.ts` fix live, build the image from this fork
-(`deploy/Dockerfile`) and run that image on hermes-oci, rather than
-`ghcr.io/nexu-io/od:latest`.
+### The earlier two-origin failure, for the record
+
+The first attempt at this deployment served the SPA as a **Vercel static
+export** and rewrote only `/api`, `/artifacts` and `/frames` to the funnel.
+The document came back `200` with no `WWW-Authenticate`, so the browser
+never received a challenge for the origin and never cached credentials.
+Every API call then reached nginx without an `Authorization` header and was
+answered `401`: the app rendered its onboarding/sign-in screen, projects
+did not load, and files could not be opened. With credentials supplied the
+whole API surface answered `200` through the same URL — the daemon and the
+proxy were never at fault, only the missing handshake.
+
+The symptom to watch for is a `200` document with `401` API calls. The fix
+is always the same: the document must be challenged on the same origin the
+API calls use.
+
+### Unused: the old two-origin arrangement
+
+The earlier text in this file described a Vercel-served static export with
+selective funnel rewrites. That arrangement is gone, and the notes below are
+kept only as a record of the failure mode.
+
+The failure was: the document came back `200` with no
+`WWW-Authenticate`, so the browser never received a challenge for the origin
+and never cached credentials; every API call then reached nginx without an
+`Authorization` header and was answered `401`. The daemon and the proxy were
+never at fault — with credentials supplied the whole API surface answered
+`200` through the same URL.
 
 ## Verifying a deployment
 
@@ -183,29 +201,42 @@ it was supposed to.
 
 ```bash
 B=https://blueishdragonz-opendesign.vercel.app
+PW=$(ssh hermes-oci 'grep -E "^OD_API_TOKEN=" /home/opc/open-design/.env | cut -d= -f2-')
 
-# Deep links must serve the SPA shell: 200, 14303 bytes.
-# Next's own 404 page is 13316 bytes — a 13316 response means the fallback broke.
-for p in / /projects /projects/p1 /settings /oc/foo; do
-  printf "%-16s " "$p"; curl -sS -o /dev/null -w "%{http_code} %{size_download}\n" "$B$p"
+# 1. THE HANDSHAKE. The document must be challenged with the OpenDesign
+#    realm, on the same origin the API uses. A 200 here means the handshake
+#    is broken and every feature will fail with 401s.
+curl -sSI "$B/" | grep -iE "^HTTP|www-authenticate"
+#   expect: HTTP/2 401 + www-authenticate: Basic realm="OpenDesign"
+
+# 2. With credentials, the document and the API are all served.
+for p in / /projects /oc/foo /api/health /api/projects; do
+  printf "%-16s " "$p"
+  curl -sS -u "blueishdragonz:$PW" -o /dev/null -w "%{http_code} %{size_download}\n" "$B$p"
 done
 
-# Trailing slash must redirect, then serve the shell.
-curl -sSL -o /dev/null -w "%{url_effective} %{http_code}\n" "$B/projects/"
+# 3. Static assets must serve their REAL bytes, not the 14 KB HTML shell.
+curl -sS -u "blueishdragonz:$PW" -o /dev/null \
+  -w "%{http_code} %{size_download} %{content_type}\n" "$B/_next/static/chunks/<hash>.js"
 
-# Static assets must still serve their REAL bytes. A too-greedy catch-all
-# returns the 14 KB HTML shell instead of the asset.
-curl -sS -o /dev/null -w "%{http_code} %{size_download} %{content_type}\n" "$B/app-icon.png"
-
-# API proxy (token lives on hermes-oci).
-TOKEN=$(ssh hermes-oci 'grep -E "^OD_API_TOKEN=" /home/opc/open-design/.env | cut -d= -f2- | tr -d "\"'"'"'"')
-curl -s -o /dev/null -w "%{http_code}\n" -u "blueishdragonz:$TOKEN" "$B/api/health"
+# 4. SSE must stream (the app's live channels).
+curl -sS -u "blueishdragonz:$PW" -N --max-time 8 "$B/api/memory/events"
+#   expect: "event: connected"
 ```
 
 The delete-flow patch lives in a **lazy-loaded** chunk, so it is not in the
 page HTML. Crawl the chunk map (it is in the `turbopack-<hash>.js` runtime,
 not in the initial `<script>` tags) and look for the minified branch
 `y=r&&!i?"ready"` (fixed) versus `y=r&&!i?"error"` (broken).
+
+Because the UI now ships inside the daemon image, verify the patch in the
+**running container**, not in a local build:
+
+```bash
+ssh hermes-oci 'docker exec open-design sh -c \
+  "grep -rhoE \".{0,60}delete-confirmation.{0,90}\" /app/apps/web/out/_next/static/chunks | head -2"'
+#   expect: ...y=r&&!n?"ready":f,k=r&&!n?0:h?h.publications...
+```
 
 ## Keeping this fork in step with upstream
 
@@ -242,16 +273,25 @@ risky than a merge.
 
 ## Deploying
 
+The Vercel project is a **pure reverse proxy** — it builds nothing, so
+deploying it is just a config push:
+
 ```bash
 cd <this checkout>
-pnpm install --frozen-lockfile
-pnpm guard && pnpm typecheck          # repo policy before publication
-vercel --prod --yes
+vercel deploy --prod --yes --archive=tgz
 ```
 
+`--archive=tgz` is required: this repo has more than 15000 files and Vercel
+rejects a plain upload with `missing_archive`.
+
 The Vercel project is `blueishdragonz-opendesign` (team `homelab-143b`),
-linked via `.vercel/`. `vercel deploy` uploads the **working tree**, so the
-local patches must be present (committed or uncommitted) at deploy time.
+linked via `.vercel/`.
+
+The **application** is deployed separately, on hermes-oci, as a Docker image
+built from this fork — see "Why the daemon image is built from this fork"
+above for the rebuild recipe. Changing `apps/web` or `apps/daemon` here
+requires rebuilding that image and recreating the container; the Vercel
+deploy alone does not ship application code.
 
 ## Deployment protection
 
@@ -260,3 +300,21 @@ The project is private and Vercel Authentication is enabled. The
 redirect to `vercel.com/sso-api` — that is expected and is **not** a sign
 that the app is broken. Verify through the project alias
 (`blueishdragonz-opendesign.vercel.app`), which is publicly reachable.
+
+## n8n on the same VM
+
+n8n and OpenDesign share hermes-oci, the nginx instance and the tailnet
+node, but nothing else:
+
+| | n8n | OpenDesign |
+|---|---|---|
+| Funnel port | 443 | 8443 |
+| nginx server block | `:8080` in `n8n-proxy.conf` | `:8009` in `opendesign-proxy.conf` |
+| Upstream | `127.0.0.1:5678` | `127.0.0.1:7456` |
+| Auth realm | `n8n` | `OpenDesign` |
+| htpasswd | `/etc/nginx/.htpasswd` | `/etc/nginx/.htpasswd-opendesign` |
+
+Both blocks live in `/etc/nginx/conf.d/`, so `nginx -t && nginx -s reload`
+picks up a change to either. Do not merge the two blocks: nginx picks a
+server block by `listen` + `server_name`, and sharing one would put two
+services' documents behind one credential realm.
