@@ -1,20 +1,10 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "buildCommand": "OD_WEB_OUTPUT_MODE= pnpm --filter @open-design/web build",
-  "installCommand": "pnpm install",
-  "outputDirectory": "apps/web/out",
+  "buildCommand": "mkdir -p .vercel-proxy && printf 'OpenDesign proxy deployment. The app is served by the daemon on hermes-oci; see docs/self-host-vercel.md.\\n' > .vercel-proxy/proxy.txt",
+  "installCommand": "echo 'no install needed: this project is a reverse proxy'",
+  "outputDirectory": ".vercel-proxy",
   "framework": null,
-  "redirects": [
-    {
-      "source": "/:path((?!api/|artifacts/|frames/|_next/)[^/]+(?:/[^/]+)*)/",
-      "destination": "/:path",
-      "permanent": false
-    }
-  ],
-  "rewrites": [
-    { "source": "/api/:path*", "destination": "https://hermes-vnic-1.taila8a61a.ts.net/api/:path*" },
-    { "source": "/artifacts/:path*", "destination": "https://hermes-vnic-1.taila8a61a.ts.net/artifacts/:path*" },
-    { "source": "/frames/:path*", "destination": "https://hermes-vnic-1.taila8a61a.ts.net/frames/:path*" },
-    { "source": "/:path*", "destination": "/index.html" }
+  "routes": [
+    { "src": "/(.*)", "dest": "https://hermes-vnic-1.taila8a61a.ts.net:8443/$1" }
   ]
 }
