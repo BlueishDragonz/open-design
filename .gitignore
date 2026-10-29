@@ -106,3 +106,6 @@ deploy/agent-bins/
 # Python bytecode from workflow helper self-checks / local compile.
 __pycache__/
 *.py[cod]
+
+# Vercel CLI project link (local deploy state, not repo content)
+.vercel
