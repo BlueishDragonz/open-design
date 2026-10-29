@@ -95,6 +95,87 @@ frontend gate — but the correct fix (`if (!context) return 0;`) touches
 upstream-shared share-flow logic and is left for a deliberate upstream PR
 rather than a local patch.
 
+## Known gap: the frontend and the daemon are on two origins
+
+**This deployment is not the topology upstream documents, and the split
+breaks the browser's credential handshake.** Everything below describes the
+current fork-local arrangement; upstream's documented arrangement is
+described at the end of this section.
+
+Upstream ships the web UI and the API from **one** origin. The published
+container serves both: `deploy/docker-compose.yml` sets `OD_PORT=7456` and
+`OD_WEB_PORT=7456`, and `deploy/README.md` states it outright — *"The daemon
+serves both the API and the built Next.js static export, so there is no
+separate nginx container."* The daemon answers `/` with the SPA shell and
+`/_next/static/...` with the assets, and `apps/daemon/src/server.ts`
+challenges the **document navigation** with
+`WWW-Authenticate: Basic realm="OpenDesign"` before it serves shell bytes.
+The browser prompts once, caches those credentials for the origin, and every
+later same-origin `/api` call carries the header. The whole design depends
+on the document and the API sharing an origin.
+
+This fork splits them:
+
+```
+browser ─▶ blueishdragonz-opendesign.vercel.app   (Vercel static export, NO auth)
+             │  document  → 200, no WWW-Authenticate   ← the handshake never starts
+             └─ /api, /artifacts, /frames ─▶ funnel ─▶ nginx auth_basic ─▶ daemon
+```
+
+The document is served by Vercel with no authentication, so the browser
+never receives a 401 challenge for the origin and never caches credentials.
+Every `/api`, `/artifacts` and `/frames` request therefore arrives at nginx
+without an `Authorization` header and is answered `401`. The app renders its
+onboarding/sign-in screen instead of the project list, and files cannot be
+opened.
+
+This is **not** a daemon or proxy fault. With credentials supplied, the whole
+API surface answers `200` through the same Vercel URL
+(`/api/version`, `/api/projects`, `/api/app-config`, `/api/agents`,
+`/api/plugins`, `/api/skills`, `/api/design-systems`), and Vercel does
+forward the `Authorization` header upstream. Only the handshake is missing.
+
+Two further consequences of the split:
+
+- nginx's `location /` on the funnel proxies to **n8n** (`127.0.0.1:5678`),
+  not to the daemon. OpenDesign's own UI is not reachable through the funnel
+  at all — only the API paths are. The documented single-origin model would
+  put it at the funnel root.
+- Upstream's `vercel.json` has **no** rewrites. The catch-all SPA rewrite
+  and the three funnel rewrites in this fork are local additions. Upstream's
+  supported way to run a separate frontend against a remote daemon is the
+  **web sidecar** (`apps/web/sidecar/server.ts`, `OD_WEB_OUTPUT_MODE=server`),
+  a Node server that serves the SPA and proxies `/api`, `/artifacts` and
+  `/frames` to the daemon — it forwards the browser's `Authorization` header
+  unchanged and does not inject credentials of its own. A raw static export
+  on Vercel has no equivalent.
+
+### Closing the gap
+
+Make the document and the API share an origin again, so the browser gets one
+401 challenge and caches the credentials:
+
+1. Point the Vercel deployment at the daemon for **all** paths (document,
+   `/_next/...`, `/api`, `/artifacts`, `/frames`) instead of serving a static
+   export — a `/:path*` rewrite to the funnel, no `destination:
+   /index.html`.
+2. Give nginx an OpenDesign server block that proxies those paths to
+   `127.0.0.1:7456` with `auth_basic "OpenDesign"`, including the document.
+   n8n currently owns `location /` on that server (it is paused, so it can
+   move to a path prefix or to port 8443).
+3. Keep `OD_DISABLE_API_AUTH=1` and `OD_API_TOKEN` as they are. That pair is
+   upstream's documented "trusted reverse proxy" mode
+   (`deploy/README.md`): the proxy authenticates every request, so the
+   daemon does not enforce bearer tokens itself.
+4. `OD_ALLOWED_ORIGINS` already lists both the Vercel origin and the funnel
+   origin, which is what `isLocalSameOrigin` needs behind a proxy.
+
+Note the trade-off: under this topology the browser receives the UI **built
+into the daemon image**, not the patched `apps/web` build. To keep this
+fork's `useProjectDeleteFlow.ts` fix live, build the image from this fork
+(`deploy/Dockerfile`) and run that image on hermes-oci, rather than
+`ghcr.io/nexu-io/od:latest`.
+
 ## Verifying a deployment
 
 The deployed site is the source of truth; never trust that a build did what
